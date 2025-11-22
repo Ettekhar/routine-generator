@@ -1,0 +1,106 @@
+"use client";
+
+import Link from "next/link";
+import { useParams } from "next/navigation";
+import { useEffect, useState } from "react";
+
+export default function BatchCourseList({ params }: { params: { id: string } }) {
+    const { id } = useParams();
+
+    const batchId = id;
+
+    const [batch, setBatch] = useState<any>(null);
+    const [list, setList] = useState<any[]>([]);
+
+    useEffect(() => {
+        fetch(`/api/batches/${batchId}`)
+            .then((r) => r.json())
+            .then(setBatch);
+
+        fetch(`/api/batches/${batchId}/courses`)
+            .then((r) => r.json())
+            .then(setList);
+    }, [batchId]);
+
+    const del = async (cid: number) => {
+        if (!confirm("Delete assignment?")) return;
+
+        await fetch(`/api/batches/${batchId}/courses/${cid}`, {
+            method: "DELETE",
+        });
+
+        setList(list.filter((i) => i.id !== cid));
+    };
+
+    if (!batch) return <div className="p-4">Loading...</div>;
+    console.log(list[1]);
+    return (
+        <div className="max-w-5xl mx-auto">
+            <div className="flex justify-between mb-6">
+                <h2 className="text-2xl font-bold">
+                    Course Assignments —{" "}
+                    <span className="text-indigo-600">{batch.name}</span>
+                </h2>
+
+                <Link
+                    href={`/batches/${batchId}/courses/create`}
+                    className="px-4 py-2 bg-indigo-600 text-white rounded"
+                >
+                    Assign Course
+                </Link>
+            </div>
+
+            <div className="bg-white border rounded shadow">
+                <table className="w-full">
+                    <thead className="bg-neutral-100">
+                        <tr>
+                            <th className="p-3">Course</th>
+                            <th className="p-3">Title</th>
+                            <th className="p-3">Lab?</th>
+                            <th className="p-3">Category</th>
+                            <th className="p-3">Groups</th>
+                            <th className="p-3 text-center">Actions</th>
+                        </tr>
+                    </thead>
+
+                    <tbody>
+                        {list.map((i) => (
+                            <tr className="border-t" key={i.id}>
+                                <td className="p-3">{i.course.code}</td>
+                                <td className="p-3">{i.course.title}</td>
+                                <td className="p-3">{i.requiresLab ? "Yes" : "No"}</td>
+                                <td className="p-3">{i.course.type}</td>
+                                <td className="p-3">{i.groupCount ?? "—"}</td>
+
+                                <td className="p-3 text-center">
+                                    <Link
+                                        href={`/batches/${batchId}/courses/${i.id}/edit`}
+                                        className="text-indigo-600 mr-4"
+                                    >
+                                        Edit
+                                    </Link>
+
+                                    <button
+                                        onClick={() => del(i.id)}
+                                        className="text-red-600 hover:underline"
+                                    >
+                                        Delete
+                                    </button>
+                                </td>
+                            </tr>
+                        ))}
+
+                        {list.length === 0 && (
+                            <tr>
+                                <td colSpan={6} className="p-4 text-center text-gray-600">
+                                    No courses assigned yet.
+                                </td>
+                            </tr>
+                        )}
+                    </tbody>
+
+                </table>
+            </div>
+        </div>
+    );
+}

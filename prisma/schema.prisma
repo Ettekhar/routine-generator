@@ -1,0 +1,134 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------- ENUMS ----------
+enum RoomType {
+  CLASSROOM
+  LAB
+}
+
+enum CourseType {
+  THEORY
+  LAB
+}
+
+// ---------- MODELS ----------
+model Teacher {
+  id             Int       @id @default(autoincrement())
+  name           String
+  shortName      String
+  designation    String
+  department     String
+  contact        String?
+  // NEW FIELDS YOU ASKED ABOUT
+  weeklyLoad     Int? // max total hours/week
+  dailyLoad      Int? // max hours/day
+  // preferredSlots String[] // example: ["SUN-10:00", "MON-14:00"]
+
+  courses   CourseAssignment[]
+  schedules Schedule[]
+}
+
+model Course {
+  id        Int                @id @default(autoincrement())
+  code      String             @unique
+  title     String
+  credit    Float
+  semester  Int
+  batches   BatchCourse[]
+  teachers  CourseAssignment[]
+  schedules Schedule[]
+  type      CourseType         @default(THEORY)
+}
+
+model Batch {
+  id        Int           @id @default(autoincrement())
+  name      String        @unique
+  size      Int
+  courses   BatchCourse[]
+  groups    BatchGroup[] // NEW
+  schedules Schedule[]
+}
+
+model BatchGroup {
+  id      Int    @id @default(autoincrement())
+  name    String // e.g., "A", "B", "C"
+  size    Int
+  batchId Int
+
+  batch     Batch      @relation(fields: [batchId], references: [id])
+  schedules Schedule[]
+}
+
+
+model Room {
+  id         Int      @id @default(autoincrement())
+  roomNumber String   @unique
+  capacity   Int
+  type       RoomType
+  schedules  Schedule[]
+}
+
+
+
+
+model Schedule {
+  id        Int    @id @default(autoincrement())
+  day       String
+  startTime String
+  endTime   String
+
+  teacherId Int
+  roomId    Int
+  courseId  Int
+  batchId   Int
+  groupId   Int?
+
+  teacher Teacher     @relation(fields: [teacherId], references: [id])
+  room    Room        @relation(fields: [roomId], references: [id])
+  course  Course      @relation(fields: [courseId], references: [id])
+  batch   Batch       @relation(fields: [batchId], references: [id])
+  group   BatchGroup? @relation(fields: [groupId], references: [id])
+}
+
+model CourseAssignment {
+  id        Int @id @default(autoincrement())
+  teacherId Int
+  courseId  Int
+
+  teacher Teacher @relation(fields: [teacherId], references: [id])
+  course  Course  @relation(fields: [courseId], references: [id])
+}
+
+model BatchCourse {
+  id          Int        @id @default(autoincrement())
+  batchId     Int
+  courseId    Int
+  requiresLab Boolean    @default(false) // is this course a lab?
+  groupCount  Int? // calculated: 1 or 2 groups
+  groups      LabGroup[] // lab group relation
+
+  batch  Batch  @relation(fields: [batchId], references: [id])
+  course Course @relation(fields: [courseId], references: [id])
+}
+
+model LabGroup {
+  id            Int    @id @default(autoincrement())
+  batchCourseId Int
+  name          String // "Group A", "Group B"
+  size          Int // auto-calculated based on batch size
+
+  batchCourse BatchCourse @relation(fields: [batchCourseId], references: [id])
+}
