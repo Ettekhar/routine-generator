@@ -5,17 +5,17 @@ export async function GET(
   req: NextRequest,
   context: { params: Promise<{ teacherId: string }> }
 ) {
+  console.log("🔥 params received:", context.params);
   const resolvedParams = await context.params;
   const teacherId = Number(resolvedParams.teacherId);
-
+  console.log({teacherId})
   if (isNaN(teacherId)) {
     return NextResponse.json({ message: "Invalid teacher ID" }, { status: 400 });
   }
-
   const assignments = await prisma.courseAssignment.findMany({
     where: { teacherId },
   });
-
+  console.log({assignments})
   return NextResponse.json(assignments);
 }
 

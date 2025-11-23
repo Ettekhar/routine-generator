@@ -795,6 +795,10 @@ async function runGA(
 // SCHEDULE GENERATION
 export async function generateFullSchedule() {
 
+  console.log("=== Clearing old schedule ===");
+  await prisma.schedule.deleteMany({});
+  console.log("Old schedule cleared.");
+
   console.log("=== Loading database ===");
   const courses = await prisma.course.findMany({
     include: {
@@ -830,8 +834,7 @@ export async function generateFullSchedule() {
       const batchName = batchInfo?.name ?? "Batch";
       const batchSize = batchInfo?.size ?? 30;
 
-      console.log(`Processing course "${course.title}" for batch "${batchName}" (${batchSize} students) with teacher "${teacherInfo.name}"`);
-
+      // ------ THEORY COURSE ------
       if (course.type === CourseType.THEORY) {
         assigns.push({
           courseId: course.id,
@@ -849,51 +852,80 @@ export async function generateFullSchedule() {
         continue;
       }
 
+      // ------ LAB COURSE ------
       const labGroups = await prisma.labGroup.findMany({
         where: { batchCourseId: bc.id }
       });
 
-      const groups = labGroups.length
-        ? labGroups
-        : [
-            {
-              id: null,
-              name: `${batchName}-Group-1`,
-              size: Math.ceil(batchSize / 2),
-              batchCourseId: bc.id,
-            } as any
-          ];
+      // Always map LAB groups → BatchGroup (the table Schedule expects)
+      let groupsForSchedule: { id: number; name: string; size: number }[] = [];
 
-      for (const g of groups) {
-        const groupId = g.id === null ? (bc.id * 1000 + g.size) : g.id;
+      if (labGroups.length > 0) {
+        // Convert each LabGroup → BatchGroup (create if missing)
+        for (const g of labGroups) {
 
-        console.log(`Adding LAB group: ${g.name ?? "Group"} (ID: ${groupId})`);
+          // Try to find corresponding BatchGroup by name + batchId
+          let bg = await prisma.batchGroup.findFirst({
+            where: {
+              batchId: bc.batchId,
+              name: g.name
+            }
+          });
 
+          if (!bg) {
+            // Create real BatchGroup since Schedule requires it
+            bg = await prisma.batchGroup.create({
+              data: {
+                batchId: bc.batchId,
+                name: g.name,
+                size: g.size
+              }
+            });
+          }
+
+          groupsForSchedule.push({
+            id: bg.id,
+            name: bg.name,
+            size: bg.size
+          });
+        }
+      } else {
+        // No groups existed → create a real BatchGroup
+        const newGroup = await prisma.batchGroup.create({
+          data: {
+            batchId: bc.batchId,
+            name: `${batchName}-Group-1`,
+            size: Math.ceil(batchSize / 2)
+          }
+        });
+
+        groupsForSchedule.push({
+          id: newGroup.id,
+          name: newGroup.name,
+          size: newGroup.size
+        });
+      }
+
+      // Push LAB assignments
+      for (const g of groupsForSchedule) {
         assigns.push({
           courseId: course.id,
           teacherId: teacherInfo.id,
           batchId: bc.batchId,
-          groupId: groupId,
+          groupId: g.id,                 // ALWAYS real BatchGroup ID
           hoursRequired: hours,
           courseType: course.type,
           courseTitle: course.title,
-          batchSize: (g as any).size ?? Math.ceil(batchSize / 2),
+          batchSize: g.size,
           teacherName: teacherInfo.name,
           batchName,
-          groupName: g.name ?? "Group"
+          groupName: g.name
         });
       }
     }
   }
 
   console.log(`Total assignment units to schedule: ${assigns.length}`);
-  console.table(assigns.map(a => ({
-    Course: a.courseTitle,
-    Teacher: a.teacherName,
-    Batch: a.batchName,
-    Group: a.groupName,
-    Hours: a.hoursRequired
-  })));
 
   console.log("Running GA to generate best schedule...");
   const bestChrom = await runGA(assigns, rooms, teachers);
@@ -921,36 +953,21 @@ export async function generateFullSchedule() {
     return t;
   }
 
-  console.log("Final schedule output:");
-  const output = bestChrom.map(a => ({
-    Day: a.day,
-    Start: a.startTime,
-    End: getEndTime(a.startTime, a.hours),
-    Course: a.courseTitle,
-    Teacher: a.teacherName,
-    Batch: a.batchName,
-    Group: a.groupName ?? "ALL",
-    Room: a.roomNumber,
-    Hours: a.hours,
-    Invalid: !!a.invalid,
-    Repaired: !!a.repaired,
-  }));
+  console.log("Saving new schedule to database...");
 
-  console.table(output);
-
-  console.log("=== Schedule generation complete ===");
-}
-
-
-generateFullSchedule()
-  .then(() => {
-    console.log("Done.");
-    process.exit(0);
-  })
-  .catch((err) => {
-    console.error(err);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
+  await prisma.schedule.createMany({
+    data: bestChrom.map(a => ({
+      day: a.day,
+      startTime: a.startTime,
+      endTime: getEndTime(a.startTime, a.hours),
+      teacherId: a.teacherId,
+      roomId: a.roomId,
+      courseId: a.courseId,
+      batchId: a.batchId,
+      groupId: a.groupId ?? null,
+    })),
   });
+
+  console.log("New schedule successfully saved!");
+  return { scheduleGroupId: Date.now() }; // return something usable
+}

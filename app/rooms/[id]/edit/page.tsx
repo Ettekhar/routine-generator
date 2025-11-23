@@ -1,9 +1,9 @@
 "use client";
-import { useRouter } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
 export default function EditRoom({ params }: { params: { id: string } }) {
-  const id = params.id;
+  const {id} = useParams();
   const router = useRouter();
   const [form, setForm] = useState<any>(null);
 

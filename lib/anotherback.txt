@@ -1,0 +1,709 @@
+import { PrismaClient, RoomType, CourseType } from '@prisma/client';
+import { PrismaPg } from "@prisma/adapter-pg";
+import "dotenv/config";
+
+const adapter = new PrismaPg({
+  connectionString: process.env.DATABASE_URL!,
+});
+const prisma = new PrismaClient({ adapter });
+
+// --- GA parameters (tweakable) ---
+const POPULATION_SIZE = 150;
+const MAX_GENERATIONS = 1000;
+// UPDATED: 0.6 is too high (random chaos). 0.06 allows evolution.
+const MUTATION_RATE = 0.06; 
+const TOURNAMENT_SIZE = 5;
+const ELITE_COUNT = 5;
+const REPAIR_ATTEMPTS = 30;
+
+// --- PENALTY WEIGHTS ---
+// HARD Constraints (Must be resolved)
+const HARD_PENALTY = -100000;
+const TEACHER_CONFLICT_PENALTY = -50000;
+const ROOM_CONFLICT_PENALTY = -50000;
+const WRONG_ROOMTYPE_PENALTY = -20000;
+const CAPACITY_PENALTY = -20000;
+const LUNCH_VIOLATION_PENALTY = -20000; 
+const MISSING_HOURS_PENALTY = -100000;
+
+// SOFT Constraints (Optimization Goals)
+const LOAD_PENALTY = -10000;           
+const SOFT_GAP_PENALTY = -500;         
+const PENALTY_ISOLATED_CLASS = -2000;  
+const PENALTY_ACTIVE_DAY = -100;       
+const PENALTY_LATE_CLASS = -10;        
+
+// NEW SOFT PENALTIES
+const PENALTY_CONSECUTIVE_SAME_COURSE = -200;  
+const PENALTY_LAB_MISALIGN = -3000;            
+const PENALTY_OVERLOADED_DAY = -500;           
+const PENALTY_TEACHER_NO_BREAK = -1500;        
+
+// BONUSES (Rewards)
+const BONUS_CONTIGUOUS = 200;          
+const BONUS_MORNING = 30;              
+const BONUS_COMPACT_DAY = 100;         
+
+type Day = "SUN" | "MON" | "TUE" | "WED" | "THU";
+const DAYS: Day[] = ["SUN", "MON", "TUE", "WED", "THU"];
+
+// 1-hour slots
+const TIME_SLOTS = [
+  "09:00", "10:00", "11:00", "12:00", 
+  "01:00", "02:00", "03:00", "04:00"
+];
+
+const LUNCH_START = "01:00";
+const LUNCH_END   = "02:00";
+
+function overlapsLunch(start: string, hours: number): boolean {
+  const startIndex = TIME_SLOTS.indexOf(start);
+  if (startIndex < 0) return false;
+  const endIndex = startIndex + hours;
+  const lunchStart = TIME_SLOTS.indexOf(LUNCH_START);
+  const lunchEnd = TIME_SLOTS.indexOf(LUNCH_END);
+  if (lunchStart === -1 || lunchEnd === -1) return false;
+  return startIndex < lunchEnd && endIndex > lunchStart;
+}
+
+// --- Types ---
+interface PlacedAssignment {
+  courseId: number;
+  teacherId: number;
+  batchId: number;
+  groupId: number | null;
+  courseType: CourseType;
+  hours: number;
+
+  day: Day;
+  startTime: string;
+  roomId: number;
+
+  courseTitle: string;
+  teacherName: string;
+  batchName: string;
+  batchSize: number;
+  groupName: string | null;
+  roomNumber: string;
+
+  repaired?: boolean;
+  invalid?: boolean;
+}
+
+interface AssignInput {
+  courseId: number;
+  teacherId: number;
+  batchId: number;
+  groupId: number | null;
+  hoursRequired: number;
+  courseType: CourseType;
+  courseTitle: string;
+  batchSize: number;
+  teacherName: string;
+  batchName: string;
+  groupName: string | null;
+}
+
+type Chromosome = PlacedAssignment[];
+type Population = { chromosome: Chromosome; fitness: number }[];
+
+interface GALookupData {
+  teacherMap: Map<number, any>;
+  roomMap: Map<number, any>;
+  assignmentMap: Map<string, AssignInput>;
+  requiredHoursMap: Map<string, number>;
+}
+
+// Slot info for tracking
+interface SlotSchedule {
+    start: number;
+    end: number;
+    courseId: number;
+    hours: number;
+}
+
+function getAssignmentKey(c: number, t: number, b: number, g: number | null) {
+  return `${c}-${t}-${b}-${g ?? 'null'}`;
+}
+
+function nextHour(time: string): string {
+  const [h, m] = time.split(":").map(Number);
+  const next = (h + 1).toString().padStart(2, "0");
+  return `${next}:${m.toString().padStart(2, "0")}`;
+}
+
+function getAvailableSlots() {
+  return DAYS.flatMap(day => TIME_SLOTS.map(t => ({ day, startTime: t })));
+}
+
+function isTimeOverlap(g1: PlacedAssignment, g2: PlacedAssignment): boolean {
+  if (g1.day !== g2.day) return false;
+  const s1 = TIME_SLOTS.indexOf(g1.startTime);
+  const s2 = TIME_SLOTS.indexOf(g2.startTime);
+  if (s1 < 0 || s2 < 0) return false;
+  const e1 = s1 + g1.hours;
+  const e2 = s2 + g2.hours;
+  return s1 < e2 && s2 < e1;
+}
+
+// ----------------- Repair Logic -----------------
+
+function geneHasConflict(
+  gene: PlacedAssignment,
+  chromosome: Chromosome,
+  lookups: GALookupData
+): { conflict: boolean; reason?: string } {
+  const room = lookups.roomMap.get(gene.roomId);
+  if (!room) return { conflict: true, reason: "missing_room" };
+
+  const startIndex = TIME_SLOTS.indexOf(gene.startTime);
+  if (startIndex < 0 || startIndex + gene.hours > TIME_SLOTS.length)
+    return { conflict: true, reason: "bounds" };
+
+  for (const other of chromosome) {
+    if (other === gene) continue;
+
+    if (isTimeOverlap(gene, other)) {
+      // 1. Teacher Collision
+      if (other.teacherId === gene.teacherId)
+        return { conflict: true, reason: "teacher" };
+
+      // 2. Room Collision
+      if (other.roomId === gene.roomId)
+        return { conflict: true, reason: "room" };
+
+      // 3. Batch/Group Collision (Parallel Support)
+      if (other.batchId === gene.batchId) {
+        // Allow parallel scheduling ONLY if groups are different (and neither is "ALL"/null)
+        // Conflict if:
+        // - Both are "ALL" (null)
+        // - One is "ALL" and other is Specific
+        // - Both are same Specific Group
+        if (
+          other.groupId === null ||
+          gene.groupId === null ||
+          other.groupId === gene.groupId
+        ) return { conflict: true, reason: "batch/group" };
+      }
+    }
+  }
+  return { conflict: false };
+}
+
+function repairChromosome(
+  chrom: Chromosome,
+  lookups: GALookupData,
+  allRooms: any[]
+) {
+  const slots = getAvailableSlots();
+  const roomCandidates = allRooms.slice().sort(() => Math.random() - 0.5);
+
+  for (const gene of chrom) {
+    const key = getAssignmentKey(
+      gene.courseId,
+      gene.teacherId,
+      gene.batchId,
+      gene.groupId
+    );
+
+    const requiredAssignment = lookups.assignmentMap.get(key);
+    if (!requiredAssignment) {
+      gene.invalid = true;
+      continue;
+    }
+
+    const neededRoomType =
+      gene.courseType === CourseType.LAB ? RoomType.LAB : RoomType.CLASSROOM;
+
+    const room = lookups.roomMap.get(gene.roomId);
+    if (!room) { gene.invalid = true; continue; }
+
+    const badRoom = room.type !== neededRoomType || room.capacity < gene.batchSize;
+    const conflict = geneHasConflict(gene, chrom, lookups);
+    const lunchIssue = overlapsLunch(gene.startTime, gene.hours);
+
+    if (!conflict.conflict && !badRoom && !lunchIssue) continue;
+
+    let fixed = false;
+
+    for (let i = 0; i < REPAIR_ATTEMPTS && !fixed; i++) {
+      // Pick random slot (biased slightly to morning for preference, but random)
+      const slot = (i < 8)
+        ? slots[Math.floor(Math.random() * Math.min(15, slots.length))]
+        : slots[Math.floor(Math.random() * slots.length)];
+
+      if (overlapsLunch(slot.startTime, gene.hours)) continue;
+
+      const validRooms = roomCandidates.filter(r =>
+        ((neededRoomType === RoomType.LAB) ? r.type === "LAB" : r.type === "CLASSROOM")
+        && r.capacity >= gene.batchSize
+      );
+
+      if (!validRooms.length) break;
+      const newRoom = validRooms[Math.floor(Math.random() * validRooms.length)];
+
+      const prev = {
+        day: gene.day,
+        startTime: gene.startTime,
+        roomId: gene.roomId,
+        roomNumber: gene.roomNumber,
+      };
+
+      gene.day = slot.day;
+      gene.startTime = slot.startTime;
+      gene.roomId = newRoom.id;
+      gene.roomNumber = newRoom.roomNumber;
+
+      const after = geneHasConflict(gene, chrom, lookups);
+
+      if (!after.conflict && !overlapsLunch(gene.startTime, gene.hours)) {
+        gene.repaired = true;
+        fixed = true;
+      } else {
+        Object.assign(gene, prev);
+      }
+    }
+
+    if (!fixed) gene.invalid = true;
+  }
+  return chrom;
+}
+
+// ----------------- Advanced Fitness Function -----------------
+
+function calculateFitness(chrom: Chromosome, lookups: GALookupData): number {
+  let fitness = 0;
+
+  const teacherDailyLoad = new Map<number, Map<Day, number>>();
+  const usedTeacherSlots = new Set<string>(); // T-{id}-{day}-{time}
+  const usedRoomSlots = new Set<string>();    // R-{id}-{day}-{time}
+  
+  // ** CORE UPDATE: Parallel Batch Tracking **
+  // Map<BatchTimeKey, Set<GroupID>>. 
+  // 'null' in Set means "Whole Batch Busy".
+  const batchOccupancy = new Map<string, Set<number | null>>(); 
+
+  const assigned = new Map<string, number>();
+  const batchSchedules = new Map<number, Map<Day, SlotSchedule[]>>();
+  const teacherSchedules = new Map<number, Map<Day, SlotSchedule[]>>();
+
+  for (const gene of chrom) {
+    if (gene.invalid) { fitness += HARD_PENALTY; continue; }
+
+    const key = getAssignmentKey(gene.courseId, gene.teacherId, gene.batchId, gene.groupId);
+    const room = lookups.roomMap.get(gene.roomId);
+    if (!room) { fitness += HARD_PENALTY; continue; }
+
+    // 1. Basic Hard Checks
+    const neededType = gene.courseType === CourseType.LAB ? "LAB" : "CLASSROOM";
+    if (room.type !== neededType) fitness += WRONG_ROOMTYPE_PENALTY;
+    if (room.capacity < gene.batchSize) fitness += CAPACITY_PENALTY;
+    if (overlapsLunch(gene.startTime, gene.hours)) fitness += LUNCH_VIOLATION_PENALTY;
+
+    const startIdx = TIME_SLOTS.indexOf(gene.startTime);
+    if (startIdx < 0 || startIdx + gene.hours > TIME_SLOTS.length) {
+      fitness += HARD_PENALTY;
+      continue;
+    }
+
+    // 2. Conflict Detection
+    let conflict = false;
+    for (let h = 0; h < gene.hours; h++) {
+      const t = TIME_SLOTS[startIdx + h];
+
+      // --- Teacher Check ---
+      const teacherKey = `T-${gene.teacherId}-${gene.day}-${t}`;
+      if (usedTeacherSlots.has(teacherKey)) {
+        fitness += TEACHER_CONFLICT_PENALTY;
+        conflict = true;
+      }
+      usedTeacherSlots.add(teacherKey);
+
+      // --- Room Check ---
+      const roomKey = `R-${gene.roomId}-${gene.day}-${t}`;
+      if (usedRoomSlots.has(roomKey)) {
+        fitness += ROOM_CONFLICT_PENALTY;
+        conflict = true;
+      }
+      usedRoomSlots.add(roomKey);
+
+      // --- Batch/Group Check (Parallel Logic) ---
+      const batchTimeKey = `B-${gene.batchId}-${gene.day}-${t}`;
+      if (!batchOccupancy.has(batchTimeKey)) {
+          batchOccupancy.set(batchTimeKey, new Set());
+      }
+      const occupiedGroups = batchOccupancy.get(batchTimeKey)!;
+
+      if (gene.groupId === null) {
+          // Current is WHOLE BATCH. Conflict if ANY group is already scheduled.
+          if (occupiedGroups.size > 0) {
+              fitness += TEACHER_CONFLICT_PENALTY; // Conflict!
+              conflict = true;
+          }
+          occupiedGroups.add(null);
+      } else {
+          // Current is SPECIFIC GROUP.
+          // Conflict if WHOLE BATCH (null) is scheduled OR SAME GROUP is scheduled.
+          if (occupiedGroups.has(null)) {
+              fitness += TEACHER_CONFLICT_PENALTY; // Blocked by whole batch
+              conflict = true;
+          }
+          if (occupiedGroups.has(gene.groupId)) {
+              fitness += TEACHER_CONFLICT_PENALTY; // Double booked group
+              conflict = true;
+          }
+          occupiedGroups.add(gene.groupId);
+      }
+    }
+
+    if (conflict) continue;
+
+    // --- Track Stats ---
+    const map = teacherDailyLoad.get(gene.teacherId) || new Map();
+    map.set(gene.day, (map.get(gene.day) ?? 0) + gene.hours);
+    teacherDailyLoad.set(gene.teacherId, map);
+
+    // Bonuses
+    if (gene.hours === 2) fitness += BONUS_CONTIGUOUS;
+    if (startIdx < 4) fitness += BONUS_MORNING;
+    if (startIdx > 5) fitness += PENALTY_LATE_CLASS;
+
+    assigned.set(key, (assigned.get(key) ?? 0) + gene.hours);
+
+    // Build Schedules for Analysis
+    const slotData: SlotSchedule = { start: startIdx, end: startIdx + gene.hours, courseId: gene.courseId, hours: gene.hours };
+    
+    if (!batchSchedules.has(gene.batchId)) batchSchedules.set(gene.batchId, new Map());
+    const bDayMap = batchSchedules.get(gene.batchId)!;
+    if (!bDayMap.has(gene.day)) bDayMap.set(gene.day, []);
+    bDayMap.get(gene.day)!.push(slotData);
+
+    if (!teacherSchedules.has(gene.teacherId)) teacherSchedules.set(gene.teacherId, new Map());
+    const tDayMap = teacherSchedules.get(gene.teacherId)!;
+    if (!tDayMap.has(gene.day)) tDayMap.set(gene.day, []);
+    tDayMap.get(gene.day)!.push(slotData);
+  }
+
+  // --- Batch Analysis (Pedagogical) ---
+  for (const [batchId, dayMap] of batchSchedules) {
+      fitness += (dayMap.size * PENALTY_ACTIVE_DAY);
+      let weeklyHours = 0;
+
+      for (const [day, slots] of dayMap) {
+          slots.sort((a, b) => a.start - b.start);
+          let dailyTotal = 0;
+          const seenCourses = new Set<number>();
+          
+          for (let i = 0; i < slots.length; i++) {
+              const curr = slots[i];
+              dailyTotal += curr.hours;
+
+              if (seenCourses.has(curr.courseId)) fitness += PENALTY_CONSECUTIVE_SAME_COURSE; 
+              seenCourses.add(curr.courseId);
+
+              if (i > 0) {
+                  const prev = slots[i-1];
+                  if (curr.start === prev.end && curr.courseId === prev.courseId) {
+                      fitness += PENALTY_CONSECUTIVE_SAME_COURSE; 
+                  }
+              }
+          }
+          weeklyHours += dailyTotal;
+          // Relaxed daily limit to 5 to account for parallel track potential hours summation
+          if (dailyTotal > 5) fitness += (dailyTotal - 5) * PENALTY_OVERLOADED_DAY; 
+      }
+      
+      // Variance Check
+      const idealAvg = weeklyHours / 5;
+      let variance = 0;
+      for (const d of DAYS) {
+          const h = dayMap.has(d) ? dayMap.get(d)!.reduce((acc, c) => acc + c.hours, 0) : 0;
+          variance += Math.abs(h - idealAvg);
+      }
+      fitness += variance * PENALTY_ACTIVE_DAY; 
+  }
+
+  // --- Teacher Load Analysis ---
+  for (const [teacherId, dayMap] of teacherSchedules) {
+    const maxLoad = lookups.teacherMap.get(teacherId)?.dailyLoad ?? 4;
+    for (const [day, slots] of dayMap) {
+      let daily = 0;
+      for (const s of slots) daily += s.hours;
+      
+      if (daily > maxLoad) fitness += LOAD_PENALTY * (daily - maxLoad);
+      if (daily <= 1) fitness += PENALTY_ISOLATED_CLASS;
+
+      // Check for breaks
+      slots.sort((a, b) => a.start - b.start);
+      let consecutive = 0;
+      for(let i=0; i<slots.length; i++) {
+          const curr = slots[i];
+          const prev = i > 0 ? slots[i-1] : null;
+          if (prev && curr.start === prev.end) {
+              if (consecutive === 0) consecutive = prev.hours + curr.hours;
+              else consecutive += curr.hours;
+          } else {
+              consecutive = 0;
+          }
+          if (consecutive > 3) fitness += PENALTY_TEACHER_NO_BREAK;
+      }
+    }
+  }
+
+  // --- Missing Hours ---
+  for (const [key, required] of lookups.requiredHoursMap) {
+    const got = assigned.get(key) ?? 0;
+    if (got < required) {
+      fitness += MISSING_HOURS_PENALTY * (required - got);
+    }
+  }
+  
+  // --- Lab Group Alignment ---
+  const labGroupMap = new Map<string, PlacedAssignment[]>();
+  for (const gene of chrom) {
+      if (gene.courseType === CourseType.LAB && gene.groupId !== null) {
+          const key = `${gene.courseId}-${gene.batchId}`;
+          const list = labGroupMap.get(key) || [];
+          list.push(gene);
+          labGroupMap.set(key, list);
+      }
+  }
+  for (const [key, labs] of labGroupMap) {
+      const groupDayMap = new Map<number, Set<Day>>();
+      for (const labGene of labs) {
+          if (labGene.groupId !== null) {
+              const days = groupDayMap.get(labGene.groupId) || new Set<Day>();
+              days.add(labGene.day);
+              groupDayMap.set(labGene.groupId, days);
+          }
+      }
+      if (groupDayMap.size > 1) { 
+          const allDays = new Set<Day>();
+          groupDayMap.forEach(days => days.forEach(day => allDays.add(day)));
+          if (allDays.size > 1) fitness += PENALTY_LAB_MISALIGN * (allDays.size - 1);
+      }
+  }
+
+  return fitness;
+}
+
+
+// ----------------- Genetic Operators -----------------
+
+function generateRandomChromosome(assigns: AssignInput[], rooms: any[]): Chromosome {
+  const chrom: Chromosome = [];
+  const expanded: (AssignInput & { assignedHours: number })[] = [];
+
+  for (const a of assigns) {
+    let remain = a.hoursRequired;
+    while (remain > 0) {
+      const hours = (remain >= 2 && a.courseType === CourseType.LAB) ? 2 : 1;
+      expanded.push({ ...a, assignedHours: hours });
+      remain -= hours;
+    }
+  }
+
+  const shuffled = expanded.sort(() => Math.random() - 0.5);
+  const slots = getAvailableSlots();
+
+  for (const a of shuffled) {
+    const slot = slots[Math.floor(Math.random() * slots.length)];
+    const validRooms = rooms.filter(r =>
+      ((a.courseType === CourseType.LAB) ? r.type === "LAB" : r.type === "CLASSROOM")
+      && r.capacity >= a.batchSize
+    );
+    const room = validRooms.length ? validRooms[Math.floor(Math.random() * validRooms.length)] : rooms[Math.floor(Math.random() * rooms.length)];
+
+    chrom.push({
+      courseId: a.courseId,
+      teacherId: a.teacherId,
+      batchId: a.batchId,
+      groupId: a.groupId,
+      courseType: a.courseType,
+      hours: a.assignedHours,
+      day: slot.day as Day,
+      startTime: slot.startTime,
+      roomId: room.id,
+      courseTitle: a.courseTitle,
+      teacherName: a.teacherName,
+      batchName: a.batchName,
+      batchSize: a.batchSize,
+      groupName: a.groupName,
+      roomNumber: room.roomNumber,
+    });
+  }
+  return chrom;
+}
+
+function mutate(chrom: Chromosome, rooms: any[]) {
+  for (const gene of chrom) {
+    if (Math.random() > MUTATION_RATE) continue;
+    const slots = getAvailableSlots();
+    if (Math.random() < 0.5) {
+      const sl = slots[Math.floor(Math.random() * slots.length)];
+      gene.day = sl.day as Day;
+      gene.startTime = sl.startTime;
+    } else {
+      const valid = rooms.filter(r =>
+        ((gene.courseType === CourseType.LAB) ? r.type === "LAB" : r.type === "CLASSROOM")
+        && r.capacity >= gene.batchSize
+      );
+      const pick = valid.length ? valid[Math.floor(Math.random() * valid.length)] : rooms[Math.floor(Math.random() * rooms.length)];
+      gene.roomId = pick.id;
+      gene.roomNumber = pick.roomNumber;
+    }
+    gene.repaired = false;
+    gene.invalid = false;
+  }
+  return chrom;
+}
+
+function tournamentSelection(pop: Population): Chromosome {
+  let best = pop[Math.floor(Math.random() * pop.length)];
+  for (let i = 1; i < TOURNAMENT_SIZE; i++) {
+    const c = pop[Math.floor(Math.random() * pop.length)];
+    if (c.fitness > best.fitness) best = c;
+  }
+  return JSON.parse(JSON.stringify(best.chromosome));
+}
+
+function crossover(a: Chromosome, b: Chromosome): [Chromosome, Chromosome] {
+  const max = Math.max(a.length, b.length);
+  const o1: Chromosome = [];
+  const o2: Chromosome = [];
+  for (let i = 0; i < max; i++) {
+    const g1 = a[i];
+    const g2 = b[i];
+    if (Math.random() < 0.5) {
+      if (g1) o1.push(JSON.parse(JSON.stringify(g1)));
+      if (g2) o2.push(JSON.parse(JSON.stringify(g2)));
+    } else {
+      if (g2) o1.push(JSON.parse(JSON.stringify(g2)));
+      if (g1) o2.push(JSON.parse(JSON.stringify(g1)));
+    }
+  }
+  return [o1, o2];
+}
+
+function initializePopulation(assigns: AssignInput[], rooms: any[], lookups: GALookupData): Population {
+  const pop: Population = [];
+  for (let i = 0; i < POPULATION_SIZE; i++) {
+    const chrom = generateRandomChromosome(assigns, rooms);
+    repairChromosome(chrom, lookups, rooms);
+    pop.push({ chromosome: chrom, fitness: calculateFitness(chrom, lookups) });
+  }
+  return pop;
+}
+
+async function runGA(assigns: AssignInput[], rooms: any[], teachers: any[]): Promise<Chromosome> {
+  const teacherMap = new Map(teachers.map(t => [t.id, t]));
+  const roomMap    = new Map(rooms.map(r => [r.id, r]));
+  const assignmentMap = new Map(assigns.map(a => [getAssignmentKey(a.courseId, a.teacherId, a.batchId, a.groupId), a]));
+  const requiredHoursMap = new Map(assigns.map(a => [getAssignmentKey(a.courseId, a.teacherId, a.batchId, a.groupId), a.hoursRequired]));
+  const lookups: GALookupData = { teacherMap, roomMap, assignmentMap, requiredHoursMap };
+
+  let population = initializePopulation(assigns, rooms, lookups);
+  let best = population.reduce((a, b) => (b.fitness > a.fitness ? b : a));
+
+  console.log(`Initial Best Fitness: ${best.fitness}`);
+
+  for (let gen = 0; gen < MAX_GENERATIONS; gen++) {
+    population.sort((a, b) => b.fitness - a.fitness);
+    const next: Population = [];
+    for (let i = 0; i < ELITE_COUNT; i++) next.push(population[i]);
+
+    while (next.length < POPULATION_SIZE) {
+      const p1 = tournamentSelection(population);
+      const p2 = tournamentSelection(population);
+      let [c1, c2] = crossover(p1, p2);
+      c1 = mutate(c1, rooms);
+      c2 = mutate(c2, rooms);
+      repairChromosome(c1, lookups, rooms);
+      repairChromosome(c2, lookups, rooms);
+      next.push({ chromosome: c1, fitness: calculateFitness(c1, lookups) });
+      if (next.length < POPULATION_SIZE) next.push({ chromosome: c2, fitness: calculateFitness(c2, lookups) });
+    }
+    population = next;
+    if (population[0].fitness > best.fitness) best = population[0];
+    if ((gen + 1) % 100 === 0) console.log(`GEN ${gen + 1}, Best = ${best.fitness}`);
+  }
+  console.log(`\nGA Complete. Final Best Fitness: ${best.fitness.toFixed(2)}`);
+  return best.chromosome;
+}
+
+export async function generateFullSchedule() {
+  console.log("Loading database...");
+  const courses = await prisma.course.findMany({
+    include: { batches: { include: { batch: true } }, teachers: true }
+  });
+  const rooms = await prisma.room.findMany();
+  const teachers = await prisma.teacher.findMany();
+  const assigns: AssignInput[] = [];
+
+  for (const course of courses) {
+    const hours = Math.round(course.credit);
+    for (const bc of course.batches) {
+      const assignedTeacher = course.teachers[0];
+      if (!assignedTeacher) continue;
+      const teacherInfo = teachers.find(t => t.id === assignedTeacher.teacherId);
+      if (!teacherInfo) continue;
+      const batchInfo = await prisma.batch.findUnique({ where: { id: bc.batchId }, select: { name: true, size: true } });
+      const batchName = batchInfo?.name ?? "Batch";
+      const batchSize = batchInfo?.size ?? 30;
+
+      if (course.type === CourseType.THEORY) {
+        assigns.push({
+          courseId: course.id, teacherId: teacherInfo.id, batchId: bc.batchId, groupId: null,
+          hoursRequired: hours, courseType: course.type, courseTitle: course.title,
+          batchSize, teacherName: teacherInfo.name, batchName, groupName: null
+        });
+        continue;
+      }
+
+      const labGroups = await prisma.labGroup.findMany({ where: { batchCourseId: bc.id } });
+      const groups = labGroups.length ? labGroups : [{ id: null, name: `${batchName}-Group-1`, size: Math.ceil(batchSize / 2) } as any];
+
+      for (const g of groups) {
+        const gid = g.id ?? (bc.id * 10000 + 1);
+        assigns.push({
+          courseId: course.id, teacherId: teacherInfo.id, batchId: bc.batchId, groupId: gid,
+          hoursRequired: hours, courseType: course.type, courseTitle: course.title,
+          batchSize: (g as any).size ?? Math.ceil(batchSize / 2), teacherName: teacherInfo.name, 
+          batchName, groupName: g.name ?? "Group"
+        });
+      }
+    }
+  }
+
+  console.log(`Scheduling ${assigns.length} total assignment units...`);
+  const bestChrom = await runGA(assigns, rooms, teachers);
+
+  bestChrom.sort((a, b) => {
+    const d1 = DAYS.indexOf(a.day);
+    const d2 = DAYS.indexOf(b.day);
+    if (d1 !== d2) return d1 - d2;
+    return TIME_SLOTS.indexOf(a.startTime) - TIME_SLOTS.indexOf(b.startTime);
+  });
+
+  function getEndTime(start: string, hours: number): string {
+    const idx = TIME_SLOTS.indexOf(start);
+    const endIdx = idx + hours;
+    if (endIdx < TIME_SLOTS.length) return TIME_SLOTS[endIdx];
+    const [h, m] = start.split(":").map(Number);
+    return `${String(h + hours).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+  }
+
+  const output = bestChrom.map(a => ({
+    Day: a.day, Start: a.startTime, End: getEndTime(a.startTime, a.hours),
+    Course: a.courseTitle, Teacher: a.teacherName, Batch: a.batchName,
+    Group: a.groupName ?? "ALL", Room: a.roomNumber, Hours: a.hours, Invalid: !!a.invalid, Repaired: !!a.repaired
+  }));
+
+  console.log("\nFINAL ROUTINE:");
+  console.table(output);
+}
+
+generateFullSchedule()
+  .then(() => { console.log("Done."); process.exit(0); })
+  .catch((err) => { console.error(err); process.exit(1); })
+  .finally(async () => { await prisma.$disconnect(); });

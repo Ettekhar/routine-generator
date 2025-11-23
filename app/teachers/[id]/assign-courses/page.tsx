@@ -15,7 +15,8 @@ export default function AssignCourses({ params }: { params: { id: string } }) {
   useEffect(() => {
     fetch(`/api/teachers/${id}`).then(r => r.json()).then(setTeacher);
     fetch(`/api/courses`).then(r => r.json()).then(setCourses);
-    fetch(`/api/course-assignments?teacherId=${id}`)
+    // fetch(`/api/course-assignments?teacherId=${id}`)
+    fetch(`/api/course-assignments/${id}`)
       .then(r => r.json())
       .then((data: any) => setSelectedCourses(data.map((c: any) => c.courseId)));
   }, [id]);
@@ -36,7 +37,7 @@ export default function AssignCourses({ params }: { params: { id: string } }) {
   };
 
   if (!teacher) return <div>Loading...</div>;
-    console.log({courses,selectedCourses});
+  // console.log({courses,selectedCourses});
 
   return (
     <div className="max-w-3xl mx-auto p-4">

@@ -798,3 +798,149 @@ generateFullSchedule()
     .finally(async () => {
         await prisma.$disconnect();
     });
+
+
+
+
+
+
+
+
+    export async function generateFullSchedule() {
+    
+      console.log("Loading database...");
+      const courses = await prisma.course.findMany({
+        include: {
+          batches: { include: { batch: true } },
+          teachers: true,
+        }
+      });
+    
+      const rooms = await prisma.room.findMany();
+      const teachers = await prisma.teacher.findMany();
+    
+      const assigns: AssignInput[] = [];
+    
+      for (const course of courses) {
+    
+        const hours = Math.round(course.credit);
+    
+        for (const bc of course.batches) {
+    
+          const assignedTeacher = course.teachers[0];
+          if (!assignedTeacher) continue;
+    
+          const teacherInfo = teachers.find(t => t.id === assignedTeacher.teacherId);
+          if (!teacherInfo) continue;
+    
+          const batchInfo = await prisma.batch.findUnique({
+            where: { id: bc.batchId },
+            select: { name: true, size: true }
+          });
+    
+          const batchName = batchInfo?.name ?? "Batch";
+          const batchSize = batchInfo?.size ?? 30;
+    
+          // THEORY  → ALWAYS WHOLE BATCH (groupId = null)
+          if (course.type === CourseType.THEORY) {
+            assigns.push({
+              courseId: course.id,
+              teacherId: teacherInfo.id,
+              batchId: bc.batchId,
+              groupId: null,
+              hoursRequired: hours,
+              courseType: course.type,
+              courseTitle: course.title,
+              batchSize,
+              teacherName: teacherInfo.name,
+              batchName,
+              groupName: null
+            });
+            continue;
+          }
+    
+          // LAB  → MUST HAVE GROUPS
+          const labGroups = await prisma.labGroup.findMany({
+            where: { batchCourseId: bc.id }
+          });
+    
+          // Handle case where labs exist but no groups are defined (use a synthetic group)
+          const groups = labGroups.length
+            ? labGroups
+            : [
+                {
+                  id: null,
+                  name: `${batchName}-Group-1`,
+                  size: Math.ceil(batchSize / 2), // Assuming default split into 2 groups
+                  batchCourseId: bc.id, // Added required field
+                } as any // Cast for synthetic group structure
+              ];
+    
+          for (const g of groups) {
+              // If the group has a null ID, it's a synthetic group for a batch without defined groups,
+              // so we use a synthetic ID based on the batch/course combo to keep it distinct
+              const groupId = g.id === null ? (bc.id * 1000 + g.size) : g.id;
+    
+            assigns.push({
+              courseId: course.id,
+              teacherId: teacherInfo.id,
+              batchId: bc.batchId,
+              groupId: groupId, // Use actual or synthetic ID
+              hoursRequired: hours,
+              courseType: course.type,
+              courseTitle: course.title,
+              batchSize: (g as any).size ?? Math.ceil(batchSize / 2),
+              teacherName: teacherInfo.name,
+              batchName,
+              groupName: g.name ?? "Group"
+            });
+          }
+        }
+      }
+      console.log(`Scheduling ${assigns.length} total assignment units...`);
+      
+      // Use image tag to explain the GA process visually
+      console.log('[Image of Genetic Algorithm flow chart]');
+    
+      const bestChrom = await runGA(assigns, rooms, teachers);
+    
+      bestChrom.sort((a, b) => {
+        const d1 = DAYS.indexOf(a.day);
+        const d2 = DAYS.indexOf(b.day);
+        if (d1 !== d2) return d1 - d2;
+        return TIME_SLOTS.indexOf(a.startTime) - TIME_SLOTS.indexOf(b.startTime);
+      });
+    
+      /** Return end time string for a lesson */
+      function getEndTime(start: string, hours: number): string {
+        const startIndex = TIME_SLOTS.indexOf(start);
+        if (startIndex === -1) {
+          const [h, m] = start.split(":").map(Number);
+          return `${String(h + hours).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+        }
+        const endIndex = startIndex + hours;
+        if (endIndex <= TIME_SLOTS.length - 1) {
+          return TIME_SLOTS[endIndex];
+        }
+        let t = start;
+        for (let i = 0; i < hours; i++) t = nextHour(t);
+        return t;
+      }
+    
+      const output = bestChrom.map(a => ({
+        Day: a.day,
+        Start: a.startTime,
+        End: getEndTime(a.startTime, a.hours),
+        Course: a.courseTitle,
+        Teacher: a.teacherName,
+        Batch: a.batchName,
+        Group: a.groupName ?? "ALL",
+        Room: a.roomNumber,
+        Hours: a.hours,
+        Invalid: !!a.invalid,
+        Repaired: !!a.repaired,
+      }));
+    
+      console.log("\nFINAL ROUTINE:");
+      console.table(output);
+    }
